@@ -7,10 +7,12 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge, ValueChange, with_timeout
+from cocotb.triggers import FallingEdge, Timer, ValueChange, with_timeout
 from cocotb.utils import get_sim_time
 
 CLK_NS = 100  # 10 MHz project clock
+SETTLE_NS = 20  # wait after an output edge before sampling other outputs
+TOL_NS = 10  # timing tolerance, well below one clock period
 
 # uo_out bit positions
 SERVO0, SERVO1, FRAME_SYNC, FAULT, WDT_EXPIRED, ARMED, UPDATE_PENDING, LIMIT_HIT = range(8)
@@ -115,13 +117,26 @@ def out_bit(dut, bit):
 
 
 async def wait_level(dut, bit, level, timeout_ns):
-    """Wait until uo_out[bit] == level. Returns the simulation time in ns."""
+    """Wait until uo_out[bit] == level. Returns the time of the change in ns.
+
+    Simulators may report the bits of uo_out changing one at a time, and a
+    gate-level netlist adds small delays, so after the change is seen this
+    waits SETTLE_NS for the other bits to settle (and rejects glitches)."""
     deadline = now() + timeout_ns
-    while out_bit(dut, bit) != level:
+    while True:
+        if out_bit(dut, bit) == level:
+            t = now()
+            await Timer(SETTLE_NS, unit="ns")
+            if out_bit(dut, bit) == level:
+                return t
         remaining = deadline - now()
         assert remaining > 0, f"timeout waiting for uo_out[{bit}] == {level}"
         await with_timeout(ValueChange(dut.uo_out), remaining, "ns")
-    return now()
+
+
+def same(measured_ns, expected_ns):
+    """Compare two times, allowing for gate delays in gate-level simulation."""
+    return abs(measured_ns - expected_ns) <= TOL_NS
 
 
 async def measure_pulse(dut, bit, timeout_ns):
@@ -207,11 +222,11 @@ async def test_default_timing(dut):
     assert out_bit(dut, ARMED) == 1
     fall0 = await wait_level(dut, SERVO0, 0, timeout)
     assert out_bit(dut, SERVO1) == 0, "equal widths must fall together"
-    assert fall0 - rise0 == 1_500_000, f"pulse width {fall0 - rise0} ns"
+    assert same(fall0 - rise0, 1_500_000), f"pulse width {fall0 - rise0} ns"
 
     await host.kick()
     rise1 = await wait_level(dut, SERVO0, 1, timeout)
-    assert rise1 - rise0 == 20_000_000, f"frame period {rise1 - rise0} ns"
+    assert same(rise1 - rise0, 20_000_000), f"frame period {rise1 - rise0} ns"
 
 
 @cocotb.test()
@@ -223,7 +238,7 @@ async def test_atomic_update(dut):
     await host.arm()
 
     _, w0 = await measure_pulse(dut, SERVO0, 3 * FRAME_NS)
-    assert w0 == 1500 * FAST_TICK_NS
+    assert same(w0, 1500 * FAST_TICK_NS)
 
     # Shadow writes without COMMIT must not change the outputs
     await host.write16(POS0, 1200)
@@ -232,8 +247,8 @@ async def test_atomic_update(dut):
     r0 = await wait_level(dut, SERVO0, 1, 3 * FRAME_NS)
     assert out_bit(dut, SERVO1) == 1
     f0 = await wait_level(dut, SERVO0, 0, 3 * FRAME_NS)
-    f1 = await wait_level(dut, SERVO1, 0, 3 * FRAME_NS)
-    assert f0 - r0 == 1500 * FAST_TICK_NS and f1 - r0 == 1500 * FAST_TICK_NS
+    assert out_bit(dut, SERVO1) == 0, "equal widths must fall together"
+    assert same(f0 - r0, 1500 * FAST_TICK_NS)
     assert await host.read16(ACT0) == 1500 and await host.read16(ACT1) == 1500
 
     # COMMIT: pending flag until the boundary, then both change in the same frame
@@ -244,14 +259,14 @@ async def test_atomic_update(dut):
     assert out_bit(dut, UPDATE_PENDING) == 0
     f0 = await wait_level(dut, SERVO0, 0, 3 * FRAME_NS)
     f1 = await wait_level(dut, SERVO1, 0, 3 * FRAME_NS)
-    assert f0 - r0 == 1200 * FAST_TICK_NS, f"ch0 width {f0 - r0}"
-    assert f1 - r0 == 1800 * FAST_TICK_NS, f"ch1 width {f1 - r0}"
+    assert same(f0 - r0, 1200 * FAST_TICK_NS), f"ch0 width {f0 - r0}"
+    assert same(f1 - r0, 1800 * FAST_TICK_NS), f"ch1 width {f1 - r0}"
     assert await host.read16(ACT0) == 1200 and await host.read16(ACT1) == 1800
     assert out_bit(dut, LIMIT_HIT) == 0
 
     # Frame period check with the reconfigured timebase
     r1 = await wait_level(dut, SERVO0, 1, 3 * FRAME_NS)
-    assert r1 - r0 == FRAME_NS
+    assert same(r1 - r0, FRAME_NS)
 
     # Disabling one channel takes effect at a frame boundary
     await host.write(CTRL, CH0_EN)
@@ -281,8 +296,8 @@ async def test_limits_and_lock(dut):
     r0 = await wait_level(dut, SERVO0, 1, 3 * FRAME_NS)
     f1 = await wait_level(dut, SERVO1, 0, 3 * FRAME_NS)
     f0 = await wait_level(dut, SERVO0, 0, 3 * FRAME_NS)
-    assert f0 - r0 == 1900 * FAST_TICK_NS
-    assert f1 - r0 == 1100 * FAST_TICK_NS
+    assert same(f0 - r0, 1900 * FAST_TICK_NS)
+    assert same(f1 - r0, 1100 * FAST_TICK_NS)
     assert out_bit(dut, LIMIT_HIT) == 1
     assert await host.read16(ACT0) == 1900 and await host.read16(ACT1) == 1100
     assert await host.read8(FAULT_REG) == F_CLAMP0 | F_CLAMP1
@@ -357,7 +372,7 @@ async def test_watchdog(dut):
     assert out_bit(dut, FAULT) == 0 and out_bit(dut, WDT_EXPIRED) == 0
     await host.arm()
     _, w = await measure_pulse(dut, SERVO0, 3 * FRAME_NS)
-    assert w == 1500 * FAST_TICK_NS
+    assert same(w, 1500 * FAST_TICK_NS)
 
 
 @cocotb.test()
@@ -408,7 +423,7 @@ async def test_arming_rules(dut):
     # Correct sequence
     await host.arm()
     _, w = await measure_pulse(dut, SERVO0, 3 * FRAME_NS)
-    assert w == 1500 * FAST_TICK_NS
+    assert same(w, 1500 * FAST_TICK_NS)
     assert await host.state() == ST_RUN
 
 
@@ -426,7 +441,7 @@ async def test_interlock(dut):
     await host.clks(300)
     dut.ui_in.value = 0
     fall = await wait_level(dut, SERVO0, 0, 3 * FRAME_NS)
-    assert fall - rise == 1500 * FAST_TICK_NS, "pulse must not be truncated"
+    assert same(fall - rise, 1500 * FAST_TICK_NS), "pulse must not be truncated"
     assert out_bit(dut, FAULT) == 1 and out_bit(dut, ARMED) == 0
     await host.clks(3 * FAST_PERIOD)
     assert out_bit(dut, SERVO0) == 0 and out_bit(dut, SERVO1) == 0
@@ -442,6 +457,6 @@ async def test_interlock(dut):
     t_drop = now()
     dut.ui_in.value = 0
     fall = await wait_level(dut, SERVO0, 0, 3 * FRAME_NS)
-    assert fall - t_drop <= 6 * CLK_NS, f"cut took {fall - t_drop} ns"
+    assert fall - t_drop <= 6 * CLK_NS + TOL_NS, f"cut took {fall - t_drop} ns"
     assert out_bit(dut, SERVO1) == 0
     assert await host.state() == ST_FAULT
