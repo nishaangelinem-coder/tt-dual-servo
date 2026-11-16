@@ -62,18 +62,18 @@ module tt_um_nishaangelinem_dual_servo (
   // ------------------------------------------------------------------
   // Input synchronisers
   // ------------------------------------------------------------------
-  reg [2:0] sck_s, cs_s;
-  reg [1:0] mosi_s, hwen_s;
+  reg [2:0] sck_s;
+  reg [1:0] cs_s, mosi_s, hwen_s;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       sck_s  <= 3'b000;
-      cs_s   <= 3'b111;
+      cs_s   <= 2'b11;
       mosi_s <= 2'b00;
       hwen_s <= 2'b00;
     end else begin
       sck_s  <= {sck_s[1:0], uio_in[3]};
-      cs_s   <= {cs_s[1:0], uio_in[0]};
+      cs_s   <= {cs_s[0], uio_in[0]};
       mosi_s <= {mosi_s[0], uio_in[1]};
       hwen_s <= {hwen_s[0], ui_in[0]};
     end
@@ -84,6 +84,31 @@ module tt_um_nishaangelinem_dual_servo (
   wire cs_active = ~cs_s[1];
   wire mosi      = mosi_s[1];
   wire hw_en     = hwen_s[1];
+
+  // ------------------------------------------------------------------
+  // Registers
+  // ------------------------------------------------------------------
+  reg [1:0]  ch_en;        // CTRL[2:1]
+  reg        stop_mode;    // CTRL[4]
+  reg [5:0]  prescale;     // clk cycles per tick, minus 1
+  reg [7:0]  wdt_timeout;  // frames, 0 = disabled
+  reg [14:0] period;       // ticks per frame
+  reg [11:0] min0, max0, min1, max1;
+  reg [11:0] pos0, pos1;   // shadow (requested)
+  reg [11:0] act0, act1;   // active (clamped)
+  reg [7:0]  frame_cnt;
+  reg [6:0]  fault;
+  reg [1:0]  state;
+  reg        pending;      // commit waiting for frame boundary
+  reg        key_step;     // first key byte seen
+  reg        limit_hit;
+  reg [7:0]  wdt_cnt;
+
+  wire locked    = (state == ST_ARM_PENDING) || (state == ST_RUN);
+  wire any_fault = |fault[3:0];
+
+  wire cfg_valid = (min0 <= max0) && (min1 <= max1) &&
+                   ({3'b000, max0} < period) && ({3'b000, max1} < period);
 
   // ------------------------------------------------------------------
   // SPI slave (mode 0)
@@ -137,31 +162,6 @@ module tt_um_nishaangelinem_dual_servo (
       if (load_tx && addr == A_ACT1_L) hi_latch <= act1[11:8];
     end
   end
-
-  // ------------------------------------------------------------------
-  // Registers
-  // ------------------------------------------------------------------
-  reg [1:0]  ch_en;        // CTRL[2:1]
-  reg        stop_mode;    // CTRL[4]
-  reg [5:0]  prescale;     // clk cycles per tick, minus 1
-  reg [7:0]  wdt_timeout;  // frames, 0 = disabled
-  reg [14:0] period;       // ticks per frame
-  reg [11:0] min0, max0, min1, max1;
-  reg [11:0] pos0, pos1;   // shadow (requested)
-  reg [11:0] act0, act1;   // active (clamped)
-  reg [7:0]  frame_cnt;
-  reg [6:0]  fault;
-  reg [1:0]  state;
-  reg        pending;      // commit waiting for frame boundary
-  reg        key_step;     // first key byte seen
-  reg        limit_hit;
-  reg [7:0]  wdt_cnt;
-
-  wire locked    = (state == ST_ARM_PENDING) || (state == ST_RUN);
-  wire any_fault = |fault[3:0];
-
-  wire cfg_valid = (min0 <= max0) && (min1 <= max1) &&
-                   ({3'b000, max0} < period) && ({3'b000, max1} < period);
 
   // ------------------------------------------------------------------
   // Timebase: prescaler -> 1 us tick -> frame counter
